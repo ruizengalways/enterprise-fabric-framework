@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Spark/Delta test state
+spark-warehouse/
+metastore_db/

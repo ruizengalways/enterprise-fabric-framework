@@ -1,3 +1,3 @@
-"""SQLAlchemy-backed leases, checkpoints, audit and bounded operational state."""
+"""Domain-isolated SQL metadata, leases, checkpoints, audit and bounded run state."""
 
 __all__: tuple[str, ...] = ()

@@ -15,7 +15,6 @@ oracle. Gold models and consumer-serving releases belong to independently owned 
 - [Documentation index](docs/README.md)
 - [Expected usage model](docs/USAGE_MODEL.md)
 - [System architecture](docs/architecture/SYSTEM.md)
-- [Open decisions](docs/decisions/OPEN.md)
 
 Coding agents must also follow [AGENTS.md](AGENTS.md).
 
@@ -26,7 +25,7 @@ docs/                       canonical architecture, decisions and runbooks
 src/enterprise_fabric_framework/
   contracts/                immutable cross-layer contracts
   metadata/                 typed policy mapping and capability selection
-  control_plane/            bounded SQL state access
+  control_plane/            replaceable control-plane port and default SQL adapter
   orchestration/            planning and runtime coordination
   platform/fabric/          invocation and binding adapters
   spark/                    the only business-data runtime
@@ -35,8 +34,8 @@ src/enterprise_fabric_framework/
   cli/                      operator entry points
   utils/                    bounded deterministic utilities
 sql/control_plane/          reusable SQL schema and migration artifacts
-fabric/                     framework certification Fabric items only
 tests/                      unit, SQL, local Spark and real Fabric suites
+  fabric/items/             native Fabric items for framework integration/UAT tests
 ```
 
 Detailed ownership and the target package tree are canonical in
@@ -46,6 +45,7 @@ Detailed ownership and the target package tree are canonical in
 ## Repository boundary
 
 This is the reusable framework repository. A production domain has its own repository, isolated
-Dev/UAT/Prod workspaces and control SQL Databases. Domain repositories own Fabric items, idempotent
-metadata SQL and Gold logic; they select versioned framework capabilities rather than supplying
-private source-to-Silver Python plugins.
+Dev/UAT/Prod workspaces and a control-plane implementation. The framework supplies a default SQL
+adapter, while a company or domain may provide another adapter that satisfies the same typed port.
+Domain repositories own Fabric items, idempotent metadata desired state and Gold logic; they select
+versioned framework capabilities rather than supplying private source-to-Silver Python plugins.

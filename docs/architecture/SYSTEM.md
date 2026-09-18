@@ -6,7 +6,7 @@ source_of_truth_for:
   - runtime-invariants
   - package-ownership
   - capability-support
-last_reviewed: 2026-09-16
+last_reviewed: 2026-09-18
 ---
 
 # System architecture
@@ -19,13 +19,13 @@ Enterprise Fabric Framework is a Spark-first Microsoft Fabric framework for:
 enterprise source -> Bronze -> Silver
 ```
 
-The framework ends after a governed Silver Delta commit, reconciliation and checkpoint/audit
-completion. Domain repositories own Gold models, dimensional models, aggregates, KPIs, Power BI
-semantic models, reports and consumer cutover.
+The framework ends after a governed Silver Delta commit, reconciliation and query/audit completion
+evidence. Domain repositories own Gold models, dimensional models, aggregates, KPIs, Power BI semantic
+models, reports and consumer cutover.
 
-The framework repository publishes a reusable wheel and control-plane SQL contract. Each domain
-owns a separate repository, Dev/UAT/Prod workspaces, control SQL Databases, Fabric items, metadata
-desired state and Gold implementation.
+The framework repository publishes a reusable wheel, a logical control-plane contract and a default
+SQL adapter. Each domain owns a separate repository, Dev/UAT/Prod workspaces, a control-plane
+implementation, Fabric items, metadata desired state and Gold implementation.
 
 ## Non-negotiable invariants
 
@@ -41,7 +41,8 @@ desired state and Gold implementation.
    environment settings differ.
 7. A capability MUST NOT be advertised unless a concrete registry executor and required test
    evidence exist.
-8. Checkpoints MUST advance only after target commit and required reconciliation are proven.
+8. Spark owns streaming checkpoints; required micro-batch writes and reconciliation MUST complete
+   before the callback returns successfully.
 9. Certification MUST invoke production orchestration and runtime entry points.
 10. Domain repositories MUST NOT inject private source-to-Silver Python plugins.
 11. Fabric workspace item lifecycle and Gold behavior MUST remain outside the installed package.
@@ -50,31 +51,33 @@ desired state and Gold implementation.
 
 ```text
 domain Fabric Pipeline
-  -> plan execution group in the domain control SQL Database
+  -> plan execution group through the domain control-plane adapter
   -> freeze effective metadata and bindings
   -> Fabric Copy/Dataflow Gen2
-       or registered Spark source reader -> registered Bronze writer
-  -> completed, validated Bronze capture manifest
+       or registered Spark source reader -> registered append-only Bronze writer
+  -> published, retained Bronze Delta relation
   -> thin Spark Job Definition or Notebook launcher
   -> DatasetRunner
   -> SparkDatasetRuntime.run()
+       -> Structured Streaming micro-batches
        -> transform -> load -> reconciliation
   -> bounded evidence
-  -> audit and checkpoint commit
+  -> batch evidence and Spark-managed checkpoint recovery
 ```
 
 Fabric-native ingress is the normal path when it can land truthful source data. Spark capture is
 optional and uses a source reader independently from the Bronze representation writer. Both paths
-produce the same bounded capture-handoff contract.
+publish source-faithful append-only Bronze. Independent Silver versions consume that relation
+without synchronized capture handoff; execution semantics are canonical in `DATA_LIFECYCLE.md`.
 
 ## Public runtime contracts
 
 The orchestration-to-Spark request contains identifiers and references, not rows:
 
-- request-schema, Pipeline, capture and frozen run identities;
+- request-schema, Pipeline and frozen Bronze/Silver run identities;
 - effective configuration and binding hashes;
-- source, Bronze, staging and Silver `RelationRef` values;
-- a frozen source boundary or checkpoint window;
+- source, Bronze, staging and Silver `RelationRef` values and logical checkpoint references;
+- source selection and optional approved replay cutoff;
 - selected registered capability versions; and
 - schema, quality, reconciliation and load-policy references.
 
@@ -84,16 +87,25 @@ The runtime returns:
 - bounded read, accepted, quarantined, filtered and mutation counts;
 - Delta commit version or operation identity;
 - reconciliation summary and detailed-evidence references; and
-- proposed checkpoint and whether it is safe to commit.
+- query/batch completion and checkpoint-reference evidence.
 
 It never returns source, target or quarantined business rows to Python.
+
+The runtime depends on the typed control-plane port, not on SQL table names or a particular control
+database. The package provides a default SQL-backed implementation; a company or domain-owned
+adapter MAY persist equivalent plan, lease, run and evidence operations elsewhere.
+Custom adapters MUST preserve the port's idempotency, fencing, checkpoint and bounded-evidence
+semantics and pass the same contract tests.
 
 ## Capability registry
 
 One Spark registry is the capability source of truth for source readers, Bronze writers,
 transforms, load strategies, reconciliation and projections. Each identity is stable, versioned and
-business-neutral. Planning fails closed when the installed wheel cannot resolve a selected
-capability or when its declared request/evidence version and certification state are incompatible.
+business-neutral. A source-reader registration MUST declare whether it executes as bounded
+extraction or Structured Streaming, including whether the producer `checkpoint_ref` is required;
+planning validates that declaration and the resolved binding. Planning fails closed when the
+installed wheel cannot resolve a selected capability or when its declared request/evidence version
+and certification state are incompatible.
 
 Capabilities are named by reusable technical patterns such as `delta_sharing_snapshot@1`,
 `latest_by_version@1` or `soft_delete_marker@1`, never after a customer, payment, finance or other
@@ -119,7 +131,7 @@ a new table first composes existing operators before a new framework capability 
 | `spark/load` | Registered Silver Delta mutation | Pipeline orchestration or durable control state |
 | `spark/reconciliation` | Distributed checks and detailed evidence relations | Unbounded driver evidence |
 | `spark/projection` | Derived relations from authoritative Spark/Delta data | Gold business models |
-| `control_plane` | SQL access, frozen runs, leases, checkpoints and audit | Business data or physical binding logic |
+| `control_plane` | Control-plane port, default SQL adapter, frozen runs, query leases, checkpoint references and audit | Business data, streaming offsets/state or physical binding logic |
 | `orchestration` | Planning, claims, dependencies and runtime coordination | Strategy algorithms |
 | `platform/fabric` | Invocation normalization and physical-binding resolution | Fabric item CRUD or deployment |
 | `recovery` | Governed checkpoint/target recovery decisions | A second load implementation or Gold cutover |
@@ -150,13 +162,16 @@ src/enterprise_fabric_framework/
   cli/
   utils/
 
-sql/control_plane/     versioned reusable SQL schema and procedures
-fabric/               framework certification items only
+sql/control_plane/     default SQL adapter schema, views, procedures and migrations
 tests/unit/           bounded Python tests
 tests/sql/            control-plane SQL contract tests
 tests/spark/          local production-path Spark/Delta tests
 tests/fabric/         real Fabric integration and release-gated UAT
+  items/              native Fabric definitions used by those tests
 ```
+
+Fabric test resource ownership and layout are canonical in
+[Testing](TESTING.md#target-directories).
 
 Directories SHOULD be added with their first executable artifact rather than retained as empty
 placeholders.
@@ -175,11 +190,20 @@ A capability is production-supported only when it:
 ## Glossary
 
 - **Capture mode**: how a source boundary is obtained, such as FULL, WATERMARK or CDC.
-- **Bronze representation**: what the retained capture truthfully means: SNAPSHOT, EVENT_LOG,
-  CURRENT_STAGE or an approved EPHEMERAL exception.
-- **Load strategy**: how a completed Bronze capture mutates Silver.
-- **Dataset contract**: versioned source-to-Silver semantics and schema for one logical dataset.
-- **Dataset run**: immutable compiled Silver-consumer execution plan.
-- **Capture manifest**: bounded evidence that a specific Bronze boundary completed and is readable.
+- **Bronze representation**: what append-retained source facts mean: SNAPSHOT or EVENT_LOG;
+  EPHEMERAL is reserved and unavailable.
+- **Load strategy**: how streamed Bronze facts mutate Silver.
+- **Source-to-Bronze configuration**: versioned producer definition in `metadata.source_to_bronze_config`.
+- **Bronze-to-Silver configuration**: versioned consumer definition in `metadata.bronze_to_silver_config`
+  referencing a Source-to-Bronze configuration.
+- **Dataset contract**: data semantics, schema and compatibility of one logical dataset version;
+  this is a data-contract concept rather than a metadata table name.
+- **Bronze run**: immutable compiled plan and execution record for one Source-to-Bronze invocation.
+- **Silver run**: immutable compiled plan for one Silver query invocation; its checkpoint outlives
+  individual invocations.
+- **Bronze manifest**: bounded delivery/completeness evidence, required for named snapshots.
+- **Silver manifest**: bounded result evidence for one logical micro-batch; defined in
+  [Execution evidence](CONTROL_PLANE_EVIDENCE.md#silver-manifests).
+- **Streaming checkpoint**: Spark-owned persisted query progress and state, unique per query contract.
 - **RelationRef**: logical relation identity resolved to an environment-specific physical relation.
 - **Pattern capability**: registered reusable technical behavior implemented in the framework.

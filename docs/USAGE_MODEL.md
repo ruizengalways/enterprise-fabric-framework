@@ -7,7 +7,7 @@ source_of_truth_for:
   - pipeline-usage
   - dataset-onboarding
   - development-and-promotion
-last_reviewed: 2026-09-16
+last_reviewed: 2026-09-18
 ---
 
 # Expected usage model
@@ -84,29 +84,30 @@ the domain promotes metadata that selects it.
 
 ## UC-01: Fabric-native ingress followed by Silver processing
 
-Use this when Copy or Dataflow Gen2 can land a truthful Bronze capture.
+Use this when Copy or Dataflow Gen2 can append source-faithful Bronze deliveries.
 
 ```text
 Fabric schedule
   -> domain Pipeline
-  -> plan execution group in domain control SQL Database
+  -> plan execution group through the domain control-plane adapter
   -> Copy activity or Dataflow Gen2
-  -> record completed Bronze capture manifest
+  -> publish append-only Bronze with required delivery evidence
   -> invoke generic Silver Spark Job
        request_schema_version
-       dataset_run_id
-       capture_id
+       silver_run_id
   -> DatasetRunner
-  -> selected Spark load/reconciliation
-  -> bounded evidence and checkpoint
+  -> Structured Streaming using the contract's stable checkpoint
+  -> selected Spark micro-batch load/reconciliation
+  -> bounded evidence
 ```
 
 The domain engineer creates and maintains the Copy/Dataflow activity in the Fabric UI. The package
 does not create it through an API. The activity lands source-faithful Bronze only; normalization,
 quality, SCD and Silver mutation happen in the framework Spark runtime.
 
-The Pipeline MAY process several tables in one scheduled execution group. Each table still receives
-its own frozen run, capture, evidence and checkpoint outcome.
+The Pipeline MAY process several tables in one scheduled execution group. Each producer and Silver
+consumer receives its own frozen job plan and evidence. A Silver query's checkpoint persists across
+scheduled job runs; another Silver version uses a different checkpoint.
 
 ## UC-02: Spark-native source followed by Silver processing
 
@@ -120,16 +121,23 @@ Fabric schedule
   -> generic Spark capture job
        registered source reader
        + registered Bronze writer
-  -> completed capture manifest
-  -> generic Silver Spark Job
-  -> bounded evidence and checkpoint
+  -> append-published Bronze
+  -> generic Structured Streaming Silver Spark Job
+  -> bounded evidence and Spark-managed checkpoint
 ```
 
-Capture and Silver are separate jobs by default. If Silver fails, the team retries the same capture
-without reconnecting to the source.
+Capture and Silver are separate jobs by default. If Silver fails, the team resumes its query from
+the same checkpoint without reconnecting to the source.
 
-A Delta Sharing reader, for example, does not decide whether Bronze is an immutable snapshot or a
-current-stage relation. Metadata selects a compatible writer independently.
+A Delta Sharing reader, for example, does not select Silver semantics. Metadata selects a
+compatible append-only Bronze writer independently; source facts determine whether retained rows
+represent complete snapshots, observations or ordered events.
+
+For an API without streaming support, the engineer selects a finite extraction window and the
+reader fetches its pages to completion, then appends the delivery to Bronze. Silver consumes that
+relation through its normal streaming query. See
+[Bounded Source-to-Bronze extraction](architecture/DATA_LIFECYCLE.md#bounded-source-to-bronze-extraction)
+for the source contract; this does not introduce another Silver execution mode.
 
 ## UC-03: Multiple tables with different Silver strategies
 
@@ -138,29 +146,35 @@ A Pipeline is grouped by source and operations, not SCD strategy. One execution 
 | Table | Capture | Bronze | Silver |
 |---|---|---|---|
 | `customer_event` | CDC/events | `EVENT_LOG` | APPEND |
-| `customer` | watermark | `CURRENT_STAGE` | SCD1 |
+| `customer` | watermark | `EVENT_LOG` observations | SCD1 |
 | `customer_address` | ordered changes | `EVENT_LOG` | SCD2 |
 | `country_reference` | full snapshot | `SNAPSHOT` | REPLACE |
 
-The Pipeline does not call `load.scd1()` or `load.scd2()` directly. It passes opaque run/capture
-identities to the generic launcher. The frozen SQL metadata selects the registered load executor.
+The Pipeline does not call `load.scd1()` or `load.scd2()` directly. It passes opaque job-run identities
+to the generic launcher. The frozen SQL metadata selects the registered micro-batch load executor.
 
 Conceptually, domain metadata contains:
 
 ```text
-dataset_contract: customer_address:1
+source_to_bronze_config: crm_address:1
 capture_mode: CDC
 bronze_representation: EVENT_LOG
+
+bronze_to_silver_config: customer_address:1
+source_to_bronze_config_ref: crm_address:1
 load_strategy: SCD2
+checkpoint_ref: customer_address_v1
 identity_policy: customer_id
 ordering_policy: source_version + event_id
 delete_policy: SCD2_CLOSE
 ```
 
 The actual domain source of truth is idempotent SQL calling public metadata procedures, not YAML.
-Each typed identity, ordering, delete and SCD2 policy references the contract's immutable
-`dataset_contract_id` internally. Domain SQL supplies `(dataset_id, contract_version)`; public
-procedures resolve the internal ID, so engineers do not manage environment-specific surrogate keys.
+Bronze policies/rules and Silver policies/rules reference their respective configurations internally;
+[Control-plane policy fields](architecture/CONTROL_PLANE.md#policy-fields-and-rules) defines their storage and pattern settings.
+Domain SQL supplies logical dataset IDs and versions; public procedures resolve internal IDs, so
+engineers do not manage environment-specific surrogate keys. The metadata model is canonical in
+`architecture/CONTROL_PLANE.md`.
 
 ## UC-04: Fast Dev development and debugging
 
@@ -169,7 +183,7 @@ Developers do not need to run CI/CD for every metadata edit.
 Expected loop:
 
 1. edit the domain's idempotent metadata SQL file;
-2. execute that same file manually against the domain Dev control database;
+2. execute that same file manually against the domain Dev control-plane instance;
 3. compile/inspect the frozen plan for one dataset or execution group;
 4. run the Dev Pipeline or thin diagnostic Notebook/Spark Job;
 5. inspect Bronze, Silver, Delta history and bounded evidence in Dev;
@@ -219,14 +233,13 @@ meaning, it belongs in the framework under a pattern name.
 
 ## UC-07: Temporarily stop or permanently retire a table
 
-Temporary operational suspension and durable retirement are different:
+The engineer pauses the selected producer or consumer using the configuration's `is_enabled` field
+through public metadata procedures. See [Enablement and retirement](architecture/CONTROL_PLANE.md#enablement-and-retirement)
+for switch semantics, already running jobs and preserving pause settings across deployments.
 
-- an incident-driven temporary pause uses environment-local `control.dataset_suspension` and is not
-  promoted to another environment;
-- a deliberate long-term stop sets the reviewed metadata desired state to disabled;
-- retirement of a published contract requires consumer confirmation and governed cleanup.
-
-Removing a SQL statement from Git MUST NOT silently delete or disable the dataset.
+For example, stopping Silver v1 can leave the Source-to-Bronze producer and Silver v2 enabled.
+Temporary pauses retain checkpoints for resume; retirement requires consumer confirmation and
+governed cleanup. Removing a SQL statement from Git does not silently delete or disable a dataset.
 
 ## UC-08: Build Silver v2 without disturbing v1
 
@@ -244,9 +257,16 @@ source -> Bronze v1 -> Silver v1 -> existing consumers
       -> Bronze v2 -> Silver v2 -> validation -> migrated consumers
 ```
 
-v1 and v2 have independent contract, target and checkpoint state. Domain Gold/reporting code chooses
-when to move to v2. The framework does not repoint Gold objects. After migration, v1 processing is
-paused, retained for the rollback window and removed through a separate cleanup operation.
+Create a new Bronze-to-Silver configuration for the v2 data contract with its own checkpoint when
+valid Bronze can be reused. When Bronze also needs correction, copy and correct the source-table
+configuration, register a new Source-to-Bronze configuration and Bronze relation, and attach Silver
+v2 to it.
+
+v1 and v2 run independently; matching progress is unnecessary. If comparison is needed, the
+engineer chooses a cutoff date explicitly. Domain Gold/reporting code chooses when to move to v2.
+The framework does not repoint Gold objects. After permanent v1 decommissioning its checkpoint can
+be removed under [Source-to-Bronze configuration](architecture/CONTROL_PLANE.md#source-to-bronze-configuration); a temporary pause
+retains it. Shared Bronze remains available for other consumers and replay.
 
 ## UC-09: Rebuild an existing Silver contract
 
@@ -268,15 +288,15 @@ migration, not a rebuild.
 
 The operator starts from the Pipeline run and bounded framework evidence:
 
-1. locate Pipeline, capture, dataset-run and Spark execution identities;
-2. determine whether capture completed and its exact readable boundary;
+1. locate Pipeline, Bronze/Silver run and Spark query/batch identities;
+2. determine published Bronze input and available delivery/completeness evidence;
 3. inspect Delta commit/history and persisted reconciliation references;
 4. confirm checkpoint state and lease/request ownership;
-5. retry the same capture only when the mutation outcome is known; and
+5. resume the same query checkpoint using the replay-safe load path; and
 6. preserve failed state until diagnostic evidence is retained.
 
-The operator MUST NOT resolve ambiguity by rerunning against “latest Bronze” or directly editing a
-checkpoint.
+The operator MUST NOT resolve ambiguity by deleting/editing a checkpoint or running an unrelated
+full replay into the existing target.
 
 ## Development priority rule
 

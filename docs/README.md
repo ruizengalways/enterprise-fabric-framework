@@ -1,7 +1,7 @@
 ---
 id: documentation.index
 status: current
-last_reviewed: 2026-09-16
+last_reviewed: 2026-09-17
 ---
 
 # Documentation index
@@ -15,14 +15,16 @@ link to it rather than restating its rules.
 |---|---|
 | [Expected usage model](USAGE_MODEL.md) | intended users, domain workflows, Pipeline usage and dataset onboarding |
 | [System architecture](architecture/SYSTEM.md) | product boundary, invariants, runtime flow, package ownership and glossary |
-| [Data lifecycle](architecture/DATA_LIFECYCLE.md) | source facts, capture, Bronze representations, Silver strategies and versioning |
-| [Control plane](architecture/CONTROL_PLANE.md) | SQL metadata, typed policies, frozen runs, registry, evidence, checkpoints and requests |
+| [Data lifecycle](architecture/DATA_LIFECYCLE.md) | source facts, bounded/streaming ingress, append-only Bronze, streaming Silver and versioning |
+| [Control plane](architecture/CONTROL_PLANE.md) | table catalog, policy/rule fields and relationships, public procedures, runtime state and SQL delivery lifecycle |
+| [Execution evidence](architecture/CONTROL_PLANE_EVIDENCE.md) | Silver manifest fields, commit recovery, attempt history, run summaries and bounded evidence |
+| [Control-plane examples](examples/CONTROL_PLANE_CONFIGURATION.md) | configuration values and annotated illustrative SQL; contracts remain in architecture |
 | [Fabric delivery](architecture/FABRIC_DELIVERY.md) | workspaces, Pipelines, ingress handoff, environment binding and CI/CD |
 | [Testing](architecture/TESTING.md) | unit, SQL, local Spark/Delta, Fabric UAT and release gates |
-| [Open decisions](decisions/OPEN.md) | unresolved choices requiring owner input |
 | [Rebuild runbook](operations/REBUILD.md) | operator procedure for a governed dataset rebuild |
 
-`decisions/OPEN.md` is deleted when no unresolved contract decision remains.
+Create `decisions/OPEN.md` only when an unresolved contract decision requires owner input; delete it
+when none remain. There are currently no open decisions.
 
 ## Reading paths
 
@@ -47,7 +49,7 @@ USAGE_MODEL -> SYSTEM -> FABRIC_DELIVERY -> CONTROL_PLANE -> TESTING
 Coding agent:
 
 ```text
-AGENTS.md -> this index -> USAGE_MODEL -> relevant canonical document -> OPEN
+AGENTS.md -> this index -> USAGE_MODEL -> relevant canonical document -> OPEN (if present)
 ```
 
 ## Documentation rules

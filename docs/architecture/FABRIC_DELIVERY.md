@@ -8,7 +8,7 @@ source_of_truth_for:
   - environment-promotion
   - package-cicd
   - fabric-runtime-baseline
-last_reviewed: 2026-09-16
+last_reviewed: 2026-09-18
 ---
 
 # Fabric delivery
@@ -19,15 +19,20 @@ Each domain owns one repository and isolated environment resources:
 
 ```text
 domain repository
-  -> domain Dev workspace  -> domain Dev control SQL Database
-  -> domain UAT workspace  -> domain UAT control SQL Database
-  -> domain Prod workspace -> domain Prod control SQL Database
+  -> domain Dev workspace  -> domain Dev control-plane instance
+  -> domain UAT workspace  -> domain UAT control-plane instance
+  -> domain Prod workspace -> domain Prod control-plane instance
 ```
+
+Each Workspace is the deployment/domain boundary for its control plane, Delta relations, Spark
+checkpoints and runtime state. The package does not receive a `domain_id`; the Workspace-bound
+adapter and connection establish scope.
 
 The domain repository owns Fabric Pipelines, Copy activities, Dataflow Gen2 items, thin Notebooks
 or Spark Job Definitions, Environments, Variable Libraries, schedules, metadata SQL and Gold code.
 The framework repository owns reusable package code, SQL contracts and framework certification
-assets only.
+assets only. Its native Fabric test items belong to
+[the Fabric test resource layout](TESTING.md#target-directories).
 
 Dev is the authoring environment. UAT and Prod MUST be promoted from reviewed definitions rather
 than independently rebuilt by hand. Credentials, gateways and identities remain environment-owned
@@ -57,16 +62,21 @@ write Silver APPEND, REPLACE, UPSERT, SCD1 or SCD2 targets.
 Spark exclusively owns normalization, deterministic ordering, row hashing, quality decisions,
 reconciliation, CDC interpretation, snapshot diff, projection and Silver mutation.
 
-When native ingress is insufficient, one Spark capture job composes a registered source reader and
-Bronze writer. A second generic Spark job consumes the completed capture for Silver by default, so
-Silver retry does not contact the source again.
+When native ingress is insufficient, one Spark producer job composes a registered source reader
+and append-only Bronze writer. A generic Silver Spark job independently consumes the retained
+Bronze relation through Structured Streaming, so Silver retry does not contact the source again.
+
+Copy/Dataflow or an API without a streaming reader may complete one finite extraction per producer
+invocation. The meaning and requirements of this pattern are canonical in
+[Bounded Source-to-Bronze extraction](DATA_LIFECYCLE.md#bounded-source-to-bronze-extraction).
+The following Pipeline shapes use the same Silver streaming runtime for either producer type.
 
 ## Supported Pipeline shapes
 
 ### Native ingress and Silver in one Pipeline
 
 ```text
-Copy or Dataflow Gen2 -> completed Bronze capture -> thin Spark launcher -> Silver
+Copy or Dataflow Gen2 -> append-published Bronze -> thin streaming Spark launcher -> Silver
 ```
 
 This is the normal enterprise batch topology and gives one observable Pipeline run.
@@ -74,7 +84,7 @@ This is the normal enterprise batch topology and gives one observable Pipeline r
 ### Spark capture and Silver in one Pipeline
 
 ```text
-Spark capture job -> completed manifest -> generic Silver job
+Spark producer job -> append-published Bronze -> generic streaming Silver job
 ```
 
 Use it for Delta Sharing, API, CDC or other protocols that native ingress cannot represent
@@ -82,47 +92,53 @@ truthfully.
 
 ### Decoupled producer and consumer Pipelines
 
-Use only for fan-out, different schedules, independent service levels or operational scaling. The
-producer persists an immutable manifest; consumers claim an explicit capture ID and MUST NOT select
-“latest Bronze”.
+Use for different schedules, independent service levels or operational scaling. Each Silver
+consumer reads the configured Bronze relation with its own stable Spark checkpoint. Consumers do
+not require paired runs or explicit capture-ID claims. See `DATA_LIFECYCLE.md` for execution and
+snapshot publication semantics.
 
 ## Pipeline grouping
 
 Execution groups follow source, schedule, connection, provider concurrency and ownership, not load
 strategy. One source Pipeline may contain mixed SCD1, SCD2, APPEND and REPLACE datasets. A source
 with provider limits MAY be split into several Pipelines, but they share a concurrency key and
-staggered schedules.
+staggered schedules. The metadata contract and group-boundary rules are defined in the
+[control-plane execution group design](CONTROL_PLANE.md#execution-group-design).
 
 `FULL`, `WATERMARK` and `CDC` describe capture; they do not imply Silver behavior.
 
 ## Invocation handoff
 
-Planning records domain, environment, dataset, physical bindings and calling item/run identities in
-the local control plane. The per-dataset launcher passes only:
+Planning records environment, dataset, physical bindings and calling item/run identities in the
+local control plane. The per-dataset launcher passes only:
 
 | Field | Purpose |
 |---|---|
 | `request_schema_version` | Launcher/request protocol schema version |
-| `dataset_run_id` | Opaque frozen Silver-consumer run identity |
-| `capture_id` | Explicit completed Bronze capture |
+| `silver_run_id` | Opaque frozen Bronze-to-Silver run identity |
 | `execution_request_id` | Optional approved rebuild/recovery request |
 
-The runner resolves all strategy, policy, relation and binding values from immutable control state
-and the manifest. The dataset's `contract_version` is already frozen inside `dataset_run_id`; it is
-not repeated as a launcher parameter. Physical row payloads are never Pipeline parameters.
+Source-to-Bronze launchers use an opaque `bronze_run_id` instead of `silver_run_id`. The runner resolves
+strategy, policy, Bronze relation and checkpoint binding from immutable control state. There is no
+mandatory `capture_id` argument. The dataset's `contract_version` is already frozen inside
+`silver_run_id`; it is not repeated as a launcher parameter. Physical row payloads are never
+Pipeline parameters.
+
+Scheduled Silver jobs SHOULD use the execution model in
+`DATA_LIFECYCLE.md#structured-streaming-execution`; normal stream startup resumes from its checkpoint
+and consumes available input. A frozen replay cutoff is a separate one-time request, not an offset
+reset on every Pipeline invocation.
 
 Spark Job Definition SHOULD be the stable production launcher. A Notebook MAY be used as a thin
 parameter adapter and diagnostic surface, but MUST NOT contain load or reconciliation algorithms.
 
 ## Failure and replay
 
-- Failed or partial captures are ineligible for Silver.
-- Copy/Dataflow completion exposes a capture but does not advance the Silver checkpoint.
-- Silver failure SHOULD retry the same capture rather than recapture.
+- Failed or partial snapshot deliveries are ineligible for snapshot-dependent Silver publication.
+- Copy/Dataflow appends Bronze but does not advance a Silver query's checkpoint.
+- Silver failure SHOULD resume the same query checkpoint without recapturing the source.
 - Replay follows the selected strategy's idempotency contract.
-- CURRENT_STAGE MUST retain the manifest's pinned Delta version through its approved retry period.
-- Concurrent consumers use claims and lease fencing.
-- Checkpoint advancement follows target commit and reconciliation only.
+- Checkpoint ownership, concurrency and cleanup follow `CONTROL_PLANE.md`.
 
 ## Environment-independent code
 
@@ -157,8 +173,8 @@ compatible SQL migration to be published before dependent domain metadata reache
 
 The environment deployment order is:
 
-1. publish the approved framework Environment/wheel;
-2. apply compatible control-plane migration;
+1. publish the approved framework Environment/wheel and control-plane adapter;
+2. apply compatible default-SQL migration, or deploy the equivalent adapter contract;
 3. deploy desired metadata and Fabric items;
 4. validate bindings and plan compilation;
 5. execute smoke/UAT; and
@@ -193,7 +209,8 @@ Primary references:
 
 ## Fabric UAT obligations
 
-Real Fabric tests MUST cover Copy/Dataflow handoff, incomplete capture blocking, launcher argument
-normalization, same-capture retry, connection/Lakehouse rebinding, exact wheel identity, control SQL
-compatibility, OneLake/Delta behavior and end-to-end evidence linking Pipeline, capture, Spark and
-target commit.
+Real Fabric tests MUST cover append-only Copy/Dataflow handoff, incomplete snapshot blocking,
+launcher argument normalization, checkpoint resume, independent v1/v2 queries, connection/Lakehouse
+rebinding, exact wheel identity, the selected control-plane adapter, OneLake/Delta behavior and
+end-to-end evidence linking Pipeline, Bronze/Silver runs, Spark and target commit. The default SQL
+adapter additionally requires Fabric SQL Database compatibility checks.

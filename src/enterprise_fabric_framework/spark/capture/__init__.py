@@ -1,7 +1,7 @@
 """Optional Spark-native FULL, watermark, CDC and Delta CDF source capture.
 
-Registered ``sources`` read a frozen source boundary into Spark. Independently registered
-``writers`` persist the declared Bronze representation and completed capture manifest. Use this
+Registered ``sources`` read through supported streaming protocols or bounded extraction into Spark.
+Independently registered ``writers`` append retained Bronze and publish delivery evidence. Use this
 boundary only when Fabric Copy or Dataflow Gen2 cannot satisfy the source contract.
 """
 

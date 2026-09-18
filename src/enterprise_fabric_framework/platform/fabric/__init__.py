@@ -3,4 +3,11 @@
 Fabric workspace item provisioning and deployment are deliberately outside this package.
 """
 
-__all__: tuple[str, ...] = ()
+from .invocation import FabricInvocation, normalize_invocation, run_fabric_invocation, to_spark_request
+
+__all__ = [
+    "FabricInvocation",
+    "normalize_invocation",
+    "run_fabric_invocation",
+    "to_spark_request",
+]

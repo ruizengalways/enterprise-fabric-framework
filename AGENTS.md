@@ -12,7 +12,7 @@ Rules:
 5. Keep production business-data processing in Spark/Delta. Do not introduce a Python/pandas/list
    business engine or test oracle.
 6. Domain-specific Gold logic and Fabric workspace items do not belong in this package.
-7. Preserve the public runtime path in tests and certification.
+7. Preserve the public runtime path in tests.
 
 When an open decision is resolved, update its canonical architecture section and remove it from
 `OPEN.md`.

@@ -19,11 +19,15 @@ last_reviewed: 2026-09-18
 # Control plane
 
 This document defines the logical control-plane contract and its default SQL realization. It names
-**16 logical tables: 7 metadata tables and 9 operational tables**. They are not implemented yet;
+**26 logical tables: 9 metadata tables and 17 operational tables**. They are not implemented yet;
 views, Spark checkpoint files and physical binding storage are outside this named-table count. A company
 or domain MAY provide another `ControlPlanePort` adapter, but it MUST preserve these logical
 ownership, idempotency, fencing and evidence semantics. Concrete SQL types belong to the default
 adapter's migrations.
+
+Sample rows below are illustrative, non-runnable examples of table grain and relationships. They
+are not seed data, complete schemas or production values. `evidence://...` and `delta://...`
+identify bounded evidence, never business rows.
 
 
 ## Table catalog
@@ -36,15 +40,25 @@ and ownership only; it is not a separate table model or a separate document.
 | `metadata` | metadata.execution_group | Logical group ID referenced by producer/consumer configs | Select future jobs by operational ownership; Fabric owns schedules, triggers and retry envelopes. |
 | `metadata` | metadata.source_to_bronze_config | Producer dataset/version; generated configuration PK | Configure one independent Source-to-Bronze chain, including destination and executable reader settings; consumers resolve its retained Bronze relation rather than a producer invocation. |
 | `metadata` | metadata.bronze_policy | PK/FK -> Source-to-Bronze config | Store source identity/schema and applicable extraction/publication settings. |
-| `metadata` | metadata.bronze_rule | Source-to-Bronze config plus stable rule ID | Store repeated source/Bronze quality and reconciliation checks. |
+| `metadata` | metadata.bronze_dq_rule | Source-to-Bronze config plus stable rule ID | Store repeated source/Bronze data-quality checks. |
+| `metadata` | metadata.bronze_recon_rule | Source-to-Bronze config plus stable rule ID | Store repeated source-to-publication reconciliation checks. |
 | `metadata` | metadata.bronze_to_silver_config | Consumer dataset/version; FK to a producer config | Reuse Bronze with separate Silver semantics, targets and stable query checkpoints across versions. |
 | `metadata` | metadata.silver_policy | PK/FK -> Bronze-to-Silver config | Store target identity/schema/delete settings and applicable load-strategy settings. |
-| `metadata` | metadata.silver_rule | Bronze-to-Silver config plus stable rule ID | Store repeated Silver quality and reconciliation checks independently for each version. |
+| `metadata` | metadata.silver_dq_rule | Bronze-to-Silver config plus stable rule ID | Store repeated Silver data-quality checks independently for each version. |
+| `metadata` | metadata.silver_recon_rule | Bronze-to-Silver config plus stable rule ID | Store repeated Bronze-to-target reconciliation checks independently for each version. |
 | `runtime` | control.pipeline_run | Calling Fabric Pipeline/execution-group invocation | Connect planned jobs and evidence to the observable Fabric run. |
 | `runtime` | control.bronze_run | One frozen Source-to-Bronze job referencing its config | Preserve resolved settings, boundaries and outcome across metadata edits and retries. |
 | `runtime` | control.silver_run | One frozen Bronze-to-Silver invocation referencing its config | Freeze policies/bindings while the query's stable Spark checkpoint outlives individual runs. |
 | `runtime` | control.bronze_manifest | Bronze publication/delivery/snapshot evidence | Prove what was published and whether a snapshot is complete; not a consumer scheduling cursor. |
+| `runtime` | control.bronze_dq_results | Bronze run plus rule and optional delivery | Store bounded aggregate outcomes for Bronze DQ checks. |
+| `runtime` | control.bronze_dq_violation | Bronze DQ result plus stable violation ID | Store bounded references to Bronze row-level DQ failures. |
+| `runtime` | control.bronze_recon_violation | Bronze run plus rule and stable violation ID | Store bounded expected-versus-actual source-to-publication mismatches. |
+| `runtime` | control.bronze_recon_results | Bronze run and optional delivery | Store aggregate outcomes for Bronze reconciliation rules. |
 | `runtime` | control.silver_manifest | One logical Silver micro-batch; completing run FK | Record logical batch counts, commits and reconciliation; preserve each execution attempt and count each committed change once. |
+| `runtime` | control.silver_dq_results | Silver run plus rule and optional micro-batch | Store bounded aggregate outcomes for Silver DQ checks. |
+| `runtime` | control.silver_dq_violation | Silver DQ result plus stable violation ID | Store bounded references to Silver row-level DQ failures. |
+| `runtime` | control.silver_recon_violation | Silver run plus rule and stable violation ID | Store bounded expected-versus-actual input-to-target mismatches. |
+| `runtime` | control.silver_recon_results | Silver run and optional micro-batch | Store aggregate outcomes for Silver reconciliation rules. |
 | `runtime` | control.source_cursor | Bounded producer config with `checkpoint_ref = NULL` | Persist Source-to-Bronze extraction progress only after proven Bronze publication. |
 | `runtime` | control.lease | Resource key and owning worker/run | Fence overlapping query/checkpoint/target mutations and govern shared-provider capacity with compare-and-swap fencing. |
 | `runtime` | control.execution_request | One rebuild/recovery request; `operation_type` selects its handler | Share immutable planning, approval, single claim, expiry, retry and terminal evidence across typed operation handlers. |
@@ -67,25 +81,33 @@ erDiagram
         string sourceConcurrencyKey
     }
     SourceConfig["metadata.source_to_bronze_config"] {
-        string sourceConfigId PK
+        string bronzeConfigId PK
         string executionGroupId FK
     }
     BronzePolicy["metadata.bronze_policy"] {
-        string sourceConfigId PK, FK
+        string bronzeConfigId PK, FK
     }
-    BronzeRule["metadata.bronze_rule"] {
-        string sourceConfigId PK, FK
+    BronzeDqRule["metadata.bronze_dq_rule"] {
+        string bronzeConfigId PK, FK
+        string ruleId PK
+    }
+    BronzeReconRule["metadata.bronze_recon_rule"] {
+        string bronzeConfigId PK, FK
         string ruleId PK
     }
     SilverConfig["metadata.bronze_to_silver_config"] {
         string silverConfigId PK
-        string sourceConfigId FK
+        string bronzeConfigId FK
         string executionGroupId FK
     }
     SilverPolicy["metadata.silver_policy"] {
         string silverConfigId PK, FK
     }
-    SilverRule["metadata.silver_rule"] {
+    SilverDqRule["metadata.silver_dq_rule"] {
+        string silverConfigId PK, FK
+        string ruleId PK
+    }
+    SilverReconRule["metadata.silver_recon_rule"] {
         string silverConfigId PK, FK
         string ruleId PK
     }
@@ -93,10 +115,12 @@ erDiagram
     ExecutionGroup ||--o{ SourceConfig : groups
     ExecutionGroup ||--o{ SilverConfig : plans
     SourceConfig ||--|| BronzePolicy : owns
-    SourceConfig ||--o{ BronzeRule : checks
+    SourceConfig ||--o{ BronzeDqRule : dq_checks
+    SourceConfig ||--o{ BronzeReconRule : reconciliation_checks
     SourceConfig ||--o{ SilverConfig : feeds
     SilverConfig ||--|| SilverPolicy : owns
-    SilverConfig ||--o{ SilverRule : checks
+    SilverConfig ||--o{ SilverDqRule : dq_checks
+    SilverConfig ||--o{ SilverReconRule : reconciliation_checks
 ```
 
 #### Runtime relationships
@@ -112,7 +136,7 @@ erDiagram
     BronzeRun["control.bronze_run"] {
         string bronzeRunId PK
         string pipelineRunId FK
-        string sourceConfigId FK
+        string bronzeConfigId FK
     }
     SilverRun["control.silver_run"] {
         string silverRunId PK
@@ -123,10 +147,48 @@ erDiagram
         string deliveryId PK
         string bronzeRunId FK
     }
+    BronzeDqResults["control.bronze_dq_results"] {
+        string bronzeRunId PK, FK
+        string ruleId PK
+    }
+    BronzeDqViolation["control.bronze_dq_violation"] {
+        string bronzeRunId PK, FK
+        string ruleId PK
+        string violationId PK
+    }
+    BronzeReconViolation["control.bronze_recon_violation"] {
+        string bronzeRunId PK, FK
+        string ruleId PK
+        string violationId PK
+    }
+    BronzeReconResults["control.bronze_recon_results"] {
+        string bronzeRunId PK, FK
+    }
     SilverManifest["control.silver_manifest"] {
         string queryIdentity PK
         int batchId PK
         string silverRunId FK
+    }
+    SilverDqResults["control.silver_dq_results"] {
+        string silverRunId PK, FK
+        string ruleId PK
+        int batchId PK
+    }
+    SilverDqViolation["control.silver_dq_violation"] {
+        string silverRunId PK, FK
+        string ruleId PK
+        int batchId PK
+        string violationId PK
+    }
+    SilverReconViolation["control.silver_recon_violation"] {
+        string silverRunId PK, FK
+        string ruleId PK
+        int batchId PK
+        string violationId PK
+    }
+    SilverReconResults["control.silver_recon_results"] {
+        string silverRunId PK, FK
+        int batchId PK
     }
     SourceCursor["control.source_cursor"] {
         string sourceToBronzeConfigId PK, FK
@@ -147,7 +209,15 @@ erDiagram
     PipelineRun ||--o{ BronzeRun : launches
     PipelineRun ||--o{ SilverRun : launches
     BronzeRun ||--o{ BronzeManifest : publishes
+    BronzeRun ||--o{ BronzeDqResults : evaluates
+    BronzeDqResults ||--o{ BronzeDqViolation : identifies
+    BronzeRun ||--o{ BronzeReconViolation : reconciles
+    BronzeRun ||--|| BronzeReconResults : summarizes
     SilverRun ||--o{ SilverManifest : completes
+    SilverRun ||--o{ SilverDqResults : evaluates
+    SilverDqResults ||--o{ SilverDqViolation : identifies
+    SilverRun ||--o{ SilverReconViolation : reconciles
+    SilverRun ||--o{ SilverReconResults : summarizes
     ExecutionRequest ||--o| PipelineRun : authorizes
     PipelineRun ||--o{ AuditEvent : records
     ExecutionRequest ||--o{ AuditEvent : records
@@ -173,6 +243,13 @@ checkpoint or execution algorithm.
 ```text
 PRIMARY KEY (execution_group_id)
 ```
+
+**Sample rows**
+
+| execution_group_id | display_name | source_concurrency_key |
+|---|---|---|
+| `crm_daily` | CRM daily ingestion | `crm_provider` |
+| `crm_silver_daily` | CRM customer Silver | `NULL` |
 
 ### Source to bronze configuration
 
@@ -207,6 +284,13 @@ FOREIGN KEY (execution_group_id) REFERENCES metadata.execution_group(execution_g
 UNIQUE (dataset_id, contract_version)
 ```
 
+**Sample rows**
+
+| source_to_bronze_config_id | dataset_id | contract_version | execution_group_id | capture_mode | bronze_relation_ref |
+|---:|---|---:|---|---|---|
+| `101` | `crm_customer` | `1` | `crm_daily` | `WATERMARK` | `bronze.crm_customer_v1` |
+| `102` | `crm_country` | `1` | `crm_daily` | `FULL` | `bronze.crm_country_v1` |
+
 ### bronze to silver configuration
 
 **Purpose:** Defines a Silver consumer contract over a retained Bronze relation; scope: one consumer
@@ -237,12 +321,19 @@ FOREIGN KEY (execution_group_id) REFERENCES metadata.execution_group(execution_g
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 UNIQUE (dataset_id, contract_version)
 ```
+
+**Sample rows**
+
+| bronze_to_silver_config_id | dataset_id | contract_version | source_to_bronze_config_id | load_strategy | silver_relation_ref |
+|---:|---|---:|---:|---|---|
+| `201` | `customer` | `1` | `101` | `SCD1` | `silver.customer_v1` |
+| `202` | `country` | `1` | `102` | `REPLACE` | `silver.country_v1` |
 ### Bronze policy
 
 **Purpose:** Declares source identity, schema, capture, boundary and publication policy; scope: one
 Source-to-Bronze configuration.
 
-**Description:** Its typed fields select certified source and publication capabilities; irrelevant
+**Description:** Its typed fields select registered source and publication capabilities; irrelevant
 or missing fields for the chosen capture pattern fail planning.
 
 | Column | Value | Description |
@@ -264,7 +355,7 @@ or missing fields for the chosen capture pattern fail planning.
 | `schema_ref` | schemas.crm_customer@1 | Required expected source-schema identity. |
 | `schema_columns` | [{"name":"customer_id","type":"long","nullable":false}] | Required typed schema used to validate the resolved reader schema. |
 | `schema_mode` | **STRICT** | Only the declared schema shape is accepted. |
-|  | **ADDITIVE_NULLABLE** | Declared columns remain compatible and additional nullable source columns are accepted. |
+|  | **ADDITIVE_NULLABLE** | Bronze-only reviewed mode: declared columns remain compatible and additional nullable source columns are accepted. |
 | `watermark_column` | modified_at | Optional increment-predicate column; required for a temporal `WATERMARK` capability. |
 | `watermark_tie_breaker_columns` | ["change_id"] | Optional composite-cursor tie breakers; required when the watermark column is not unique. |
 | `watermark_timezone` | UTC | Optional timezone for temporal boundaries; `NULL` for sequence or non-temporal cursors. |
@@ -279,6 +370,19 @@ or missing fields for the chosen capture pattern fail planning.
 PRIMARY KEY (source_to_bronze_config_id)
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 ```
+
+Changing `schema_mode`, `schema_ref` or `schema_columns` through the public Bronze-policy upsert
+changes only future planning; each Bronze run retains its frozen policy. To disable
+`ADDITIVE_NULLABLE`, the desired-state update MUST set `schema_ref` and `schema_columns` to the
+latest approved accepted Bronze schema and set `schema_mode = STRICT` in the same update. It MUST
+NOT drop retained Bronze columns or rewrite prior deliveries.
+
+**Sample rows**
+
+| source_to_bronze_config_id | source_fidelity | record_identity_columns | schema_mode | watermark_column |
+|---:|---|---|---|---|
+| `101` | `OBSERVATIONS` | `[delivery_id, customer_id]` | `STRICT` | `modified_at` |
+| `102` | `COMPLETE_STATE` | `[capture_id, country_code]` | `STRICT` | `NULL` |
 
 ### Silver policy
 
@@ -314,12 +418,23 @@ SCD2 and snapshot publication use conditional fields instead of separate policy 
 | `correction_window_seconds` | 604800 | Required non-negative correction window for `CORRECT_WITHIN_WINDOW`; otherwise `NULL`. |
 | `snapshot_selection_ref` | latest_complete_snapshot@1 | Optional complete-snapshot selection capability; required for snapshot-diff consumers. |
 | `snapshot_diff_apply_ref` | snapshot_diff_to_scd1@1 | Optional capability that converts snapshot differences to mutations. |
-| `replace_publication_ref` | validated_stable_target@1 | Optional certified candidate-cutover capability; required for `REPLACE` publication. |
+| `replace_publication_ref` | validated_stable_target@1 | Optional candidate-cutover capability; required for `REPLACE` publication. |
 
 ```text
 PRIMARY KEY (bronze_to_silver_config_id)
 FOREIGN KEY (bronze_to_silver_config_id) REFERENCES metadata.bronze_to_silver_config(bronze_to_silver_config_id)
 ```
+
+`metadata.silver_policy` MUST use `STRICT`; `ADDITIVE_NULLABLE` is a Bronze-only source-schema
+mode. A Silver schema change of any kind requires a new `bronze_to_silver_config` contract version
+with its own target relation and checkpoint. The existing Silver version MUST NOT evolve in place.
+
+**Sample rows**
+
+| bronze_to_silver_config_id | entity_key_columns | ordering_columns | delete_action | schema_mode |
+|---:|---|---|---|---|
+| `201` | `[customer_id]` | `[modified_at, change_id]` | `IGNORE` | `STRICT` |
+| `202` | `[country_code]` | `[]` | `IGNORE` | `STRICT` |
 
 Delete values are typed arrays, not text that the executor guesses how to interpret. When using
 both operation and marker evidence, the capability MUST declare precedence/conflict behavior.
@@ -329,11 +444,11 @@ the two stage policies may name the same field, but only Silver declares target 
 `ordering_columns` includes all required tie breakers; `effective_time_column` retains its distinct
 history-interval role even when it is also an ordering column. Snapshot selection capabilities MUST
 use complete, comparable declared scopes. REPLACE publication guards and APPEND conflict/replay
-behavior remain those of the selected certified strategy.
+behavior remain those of the selected registered strategy.
 
-### Bronze rules
+### Bronze DQ rules
 
-**Purpose:** Registers producer-side quality and reconciliation checks; scope: one
+**Purpose:** Registers producer-side data-quality checks; scope: one
 Source-to-Bronze configuration and its stable rule IDs.
 
 **Description:** Checks use child rows rather than a growing set of columns or a JSON document.
@@ -343,8 +458,6 @@ Bronze and Silver rules have separate owning foreign keys, so no row couples Sil
 |---|---|---|
 | `source_to_bronze_config_id` | 101 | Required FK to the producer configuration that owns this rule. |
 | `rule_id` | copied_count_matches_source | Required stable local rule ID, unique within its owning configuration. |
-| `rule_kind` | **QUALITY** | Validates data facts. |
-|  | **RECONCILIATION** | Compares bounded source and publication evidence. |
 | `rule_ref` | row_count_matches@1 | Required registered check capability and version. |
 | `rule_order` | 10 | Required non-negative order within the registered execution phase. |
 | `column_names` | ["customer_id"] | Optional validated input columns; use `[]` when the check consumes only aggregate or reference metrics. |
@@ -354,25 +467,56 @@ Bronze and Silver rules have separate owning foreign keys, so no row couples Sil
 |  | **GE** | Greater-than-or-equal comparison for threshold-based checks. |
 |  | **LE** | Less-than-or-equal comparison for threshold-based checks. |
 | `threshold` | 0 | Optional numeric threshold interpreted only by the registered rule capability. |
+| `severity` | **CRITICAL** | Required impact classification for a failed rule. `CRITICAL` can block its table delivery; `WARNING` records bounded evidence but does not block other tables. |
 | `failure_action` | **FAIL** | Stops the governed operation when the rule fails. |
 |  | **REPORT** | Records the failure without stopping when the rule contract permits it. |
 
 
 Each check's registry contract defines its execution phase, required fields, valid comparator,
-evidence inputs and permitted failure action. Rules run over Spark/Delta and return bounded metrics
+evidence inputs and permitted severity/failure-action combination. `FAIL` requires `CRITICAL`
+severity; `WARNING` rules use `REPORT`. Rules run over Spark/Delta and return bounded metrics
 and evidence references. No rule contains arbitrary Python, a domain callback or unrestricted SQL.
 Selected columns/references MUST exist and be declared in the frozen plan. Irrelevant or missing
 fields fail validation. Checks requiring unsupported additional parameters fail planning until the
-typed model and certified capability support them; do not add arbitrary parameter bags as a workaround.
+typed model and registered capability support them; do not add arbitrary parameter bags as a workaround.
 
 Bronze validation MUST NOT silently discard source facts and still declare a complete snapshot.
-Silver QUARANTINE is for supported row-level quality checks, not a way to ignore failed final
+Bronze DQ rules MUST NOT use `QUARANTINE`. Silver `QUARANTINE` is for supported row-level quality checks, not a way to ignore failed final
 reconciliation. Required completeness, replay/conflict and strategy invariants cannot be changed to
 REPORT or omitted by removing optional rule rows.
 
-### Silver rules
+**Sample rows**
 
-**Purpose:** Registers consumer-side quality and reconciliation checks; scope: one
+| source_to_bronze_config_id | rule_id | rule_ref | column_names | failure_action |
+|---:|---|---|---|---|
+| `101` | `customer_id_not_null` | `not_null@1` | `[customer_id]` | `FAIL` |
+| `102` | `country_code_not_null` | `not_null@1` | `[country_code]` | `FAIL` |
+
+### Bronze reconciliation rules
+
+**Purpose:** Registers producer-side source-to-publication evidence comparisons; scope: one
+Source-to-Bronze configuration and its stable rule IDs.
+
+The table uses the same owner, stable `rule_id`, registered `rule_ref`, phase, ordering, severity
+and typed comparison fields as Bronze DQ rules. Its capability compares bounded source evidence selected by
+`reference_metric_ref` or `reference_relation_ref` with Bronze publication evidence. Its
+`failure_action` is only `FAIL` or `REPORT`; reconciliation never quarantines records.
+
+```text
+PRIMARY KEY (source_to_bronze_config_id, rule_id)
+FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
+```
+
+**Sample rows**
+
+| source_to_bronze_config_id | rule_id | rule_ref | reference_metric_ref | failure_action |
+|---:|---|---|---|---|
+| `101` | `selected_matches_published` | `row_count_matches@1` | `source.selected_rows` | `FAIL` |
+| `102` | `snapshot_manifest_matches` | `file_manifest_matches@1` | `source.file_manifest` | `FAIL` |
+
+### Silver DQ rules
+
+**Purpose:** Registers consumer-side data-quality checks; scope: one
 Bronze-to-Silver configuration and its stable rule IDs.
 
 **Description:** The consumer owns these checks independently of other Silver versions, even when
@@ -382,8 +526,6 @@ they consume the same Source-to-Bronze configuration.
 |---|---|---|
 | `bronze_to_silver_config_id` | 201 | Required FK to the consumer configuration that owns this rule. |
 | `rule_id` | customer_key_not_null | Required stable local rule ID, unique within its owning configuration. |
-| `rule_kind` | **QUALITY** | Validates Silver data. |
-|  | **RECONCILIATION** | Compares bounded target and input evidence. |
 | `rule_ref` | not_null@1 | Required registered check capability and version. |
 | `rule_order` | 10 | Required non-negative order within the registered execution phase. |
 | `column_names` | ["customer_id"] | Optional validated input columns; required when the check operates on named columns. |
@@ -391,6 +533,7 @@ they consume the same Source-to-Bronze configuration.
 | `reference_metric_ref` | batch.accepted_rows | Optional bounded evidence metric; required when the rule compares a recorded metric. |
 | `comparison` | **EQ**, **GE** or **LE** | Optional typed comparator required by threshold-based checks. |
 | `threshold` | 0 | Optional numeric threshold interpreted only by the registered rule capability. |
+| `severity` | **CRITICAL** | Required impact classification for a failed rule. `CRITICAL` can block its table delivery; `WARNING` records bounded evidence but does not block other tables. |
 | `failure_action` | **FAIL** | Stops the governed operation when the rule fails. |
 |  | **REPORT** | Records the failure without stopping when the rule contract permits it. |
 |  | **QUARANTINE** | Diverts failing rows only for supported row-level quality checks. |
@@ -400,6 +543,35 @@ PRIMARY KEY (bronze_to_silver_config_id, rule_id)
 FOREIGN KEY (bronze_to_silver_config_id) REFERENCES metadata.bronze_to_silver_config(bronze_to_silver_config_id)
 ```
 
+**Sample rows**
+
+| bronze_to_silver_config_id | rule_id | rule_ref | column_names | failure_action |
+|---:|---|---|---|---|
+| `201` | `customer_key_not_null` | `not_null@1` | `[customer_id]` | `QUARANTINE` |
+| `202` | `country_name_not_null` | `not_null@1` | `[country_name]` | `FAIL` |
+
+### Silver reconciliation rules
+
+**Purpose:** Registers consumer-side Bronze-to-target evidence comparisons; scope: one
+Bronze-to-Silver configuration and its stable rule IDs.
+
+The table uses the same owner, stable `rule_id`, registered `rule_ref`, phase, ordering, severity and typed
+comparison fields as Silver DQ rules. Its capability compares bounded Bronze input and target
+mutation evidence. Its `failure_action` is only `FAIL` or `REPORT`; reconciliation never
+quarantines records.
+
+```text
+PRIMARY KEY (bronze_to_silver_config_id, rule_id)
+FOREIGN KEY (bronze_to_silver_config_id) REFERENCES metadata.bronze_to_silver_config(bronze_to_silver_config_id)
+```
+
+**Sample rows**
+
+| bronze_to_silver_config_id | rule_id | rule_ref | reference_metric_ref | failure_action |
+|---:|---|---|---|---|
+| `201` | `accepted_matches_mutations` | `mutation_count_matches@1` | `batch.accepted_rows` | `FAIL` |
+| `202` | `replace_count_matches_candidate` | `row_count_matches@1` | `candidate.accepted_rows` | `FAIL` |
+
 
 One Source-to-Bronze configuration is reusable by zero or more Bronze-to-Silver consumers. The
 consumer row owns its own Silver policy and rules, while its
@@ -408,13 +580,16 @@ consumer row owns its own Silver policy and rules, while its
 ```text
 source_to_bronze_config 101
 ├── bronze_policy 101
-├── bronze_rule (101, rule_id), zero or more
+├── bronze_dq_rule (101, rule_id), zero or more
+├── bronze_recon_rule (101, rule_id), zero or more
 ├── bronze_to_silver_config 201
 │   ├── silver_policy 201
-│   └── silver_rule (201, rule_id), zero or more
+│   ├── silver_dq_rule (201, rule_id), zero or more
+│   └── silver_recon_rule (201, rule_id), zero or more
 └── bronze_to_silver_config 202
     ├── silver_policy 202
-    └── silver_rule (202, rule_id), zero or more
+    ├── silver_dq_rule (202, rule_id), zero or more
+    └── silver_recon_rule (202, rule_id), zero or more
 ```
 
 Both consumer rows contain `source_to_bronze_config_id = 101`. The Silver policy and rule tables do
@@ -451,6 +626,8 @@ and bounded outcome evidence.
 | `status` | **PLANNED** | Frozen plan exists; Pipeline work has not started. |
 |  | **RUNNING** | Pipeline execution has started. |
 |  | **SUCCEEDED** | Required work and outcome evidence completed. |
+|  | **SUCCEEDED_WITH_WARNINGS** | Every table completed, with only non-blocking warning rule failures. |
+|  | **PARTIAL_FAILURE** | At least one independent table failed while other planned tables completed or were attempted. |
 |  | **FAILED** | Execution ended with bounded failure evidence. |
 |  | **CANCELLED** | Execution was deliberately stopped. |
 | `requested_at` | 2026-09-18T10:00:00Z | Required planning acceptance time. |
@@ -464,6 +641,13 @@ PRIMARY KEY (pipeline_run_id)
 FOREIGN KEY (execution_group_id) REFERENCES metadata.execution_group(execution_group_id)
 FOREIGN KEY (execution_request_id) REFERENCES control.execution_request(execution_request_id)
 ```
+
+**Sample rows**
+
+| pipeline_run_id | execution_group_id | environment_ref | status | plan_hash |
+|---|---|---|---|---|
+| `pipe_20260921_01` | `crm_daily` | `dev` | `SUCCEEDED` | `sha256:plan-a1` |
+| `pipe_20260921_02` | `crm_silver_daily` | `dev` | `RUNNING` | `sha256:plan-b2` |
 
 ### bronze run
 
@@ -502,6 +686,13 @@ FOREIGN KEY (pipeline_run_id) REFERENCES control.pipeline_run(pipeline_run_id)
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 FOREIGN KEY (execution_request_id) REFERENCES control.execution_request(execution_request_id)
 ```
+
+**Sample rows**
+
+| bronze_run_id | pipeline_run_id | source_to_bronze_config_id | attempt_number | status | source_boundary_ref |
+|---|---|---:|---:|---|---|
+| `bronze_20260921_01` | `pipe_20260921_01` | `101` | `1` | `SUCCEEDED` | `boundary://crm/2026-09-21T00:00Z` |
+| `bronze_20260921_02` | `pipe_20260921_01` | `102` | `1` | `SUCCEEDED` | `snapshot://crm-country/2026-09-21` |
 ### Silver Run
 
 **Purpose:** Records one frozen Silver query execution attempt; scope: one consumer configuration,
@@ -541,6 +732,13 @@ FOREIGN KEY (bronze_to_silver_config_id) REFERENCES metadata.bronze_to_silver_co
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 FOREIGN KEY (execution_request_id) REFERENCES control.execution_request(execution_request_id)
 ```
+
+**Sample rows**
+
+| silver_run_id | pipeline_run_id | bronze_to_silver_config_id | attempt_number | query_identity | status |
+|---|---|---:|---:|---|---|
+| `silver_20260921_01` | `pipe_20260921_02` | `201` | `1` | `customer_v1_generation_1` | `RUNNING` |
+| `silver_20260921_02` | `pipe_20260921_02` | `202` | `1` | `country_v1_generation_1` | `SUCCEEDED` |
 
 
 ### Bronze manifests
@@ -587,6 +785,13 @@ FOREIGN KEY (bronze_run_id) REFERENCES control.bronze_run(bronze_run_id)
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 ```
 
+**Sample rows**
+
+| delivery_id | bronze_run_id | completion_state | selected_rows | published_rows | delta_version |
+|---|---|---|---:|---:|---:|
+| `delivery_customer_20260921` | `bronze_20260921_01` | `COMPLETE` | `1,000` | `1,000` | `42` |
+| `delivery_country_20260921` | `bronze_20260921_02` | `COMPLETE` | `195` | `195` | `18` |
+
 ### Silver manifests
 
 **Purpose:** Records Silver micro-batch effects, reconciliation and completion evidence; scope: one
@@ -619,6 +824,202 @@ PRIMARY KEY (query_identity, batch_id)
 FOREIGN KEY (silver_run_id) REFERENCES control.silver_run(silver_run_id)
 ```
 
+**Sample rows**
+
+| query_identity | batch_id | silver_run_id | input_rows | accepted_rows | quarantined_rows | completion_state |
+|---|---:|---|---:|---:|---:|---|
+| `customer_v1_generation_1` | `42` | `silver_20260921_01` | `1,000` | `998` | `2` | `COMPLETE` |
+| `country_v1_generation_1` | `7` | `silver_20260921_02` | `195` | `195` | `0` | `COMPLETE` |
+
+### Bronze DQ results
+
+**Purpose:** Records the bounded aggregate result of one Bronze DQ rule for a run and optional
+delivery. It stores counts and evidence references, never business rows.
+
+| Column | Description |
+|---|---|
+| `bronze_run_id`, `rule_id` | Required composite identity; `rule_id` resolves to the frozen Bronze DQ rule. |
+| `delivery_id` | Optional FK to the delivery evaluated by the rule. |
+| `status` | `PENDING`, `PASSED` or `FAILED`. |
+| `passed_rows`, `failed_rows` | Optional bounded aggregate counts. |
+| `metrics`, `evidence_ref` | Optional bounded typed metrics and Delta evidence reference. |
+
+```text
+PRIMARY KEY (bronze_run_id, rule_id)
+FOREIGN KEY (bronze_run_id) REFERENCES control.bronze_run(bronze_run_id)
+FOREIGN KEY (delivery_id) REFERENCES control.bronze_manifest(delivery_id)
+```
+
+**Sample rows**
+
+| bronze_run_id | rule_id | delivery_id | status | passed_rows | failed_rows |
+|---|---|---|---|---:|---:|
+| `bronze_20260921_01` | `customer_id_not_null` | `delivery_customer_20260921` | `PASSED` | `1,000` | `0` |
+| `bronze_20260921_02` | `country_code_not_null` | `delivery_country_20260921` | `PASSED` | `195` | `0` |
+
+### Bronze DQ violations
+
+**Purpose:** Records a bounded reference to one row-level Bronze DQ failure. The failed row or
+sample remains in a governed Delta evidence relation named by `evidence_ref`.
+
+| Column | Description |
+|---|---|
+| `bronze_run_id`, `rule_id`, `violation_id` | Required composite identity; `violation_id` is stable for retry idempotency. |
+| `record_identity_ref`, `violation_code` | Optional record identity reference and required registered failure reason. |
+| `evidence_ref` | Optional reference to detailed governed evidence. |
+
+```text
+PRIMARY KEY (bronze_run_id, rule_id, violation_id)
+FOREIGN KEY (bronze_run_id, rule_id) REFERENCES control.bronze_dq_results(bronze_run_id, rule_id)
+```
+
+**Sample rows**
+
+| bronze_run_id | rule_id | violation_id | violation_code | record_identity_ref |
+|---|---|---|---|---|
+| `bronze_20260920_01` | `customer_id_not_null` | `v-001` | `NULL_VALUE` | `record://delivery-customer-20260920/417` |
+| `bronze_20260920_01` | `customer_id_not_null` | `v-002` | `NULL_VALUE` | `record://delivery-customer-20260920/982` |
+
+### Bronze reconciliation violations
+
+**Purpose:** Records one bounded source-to-publication reconciliation mismatch; it does not
+quarantine or replace the source evidence.
+
+| Column | Description |
+|---|---|
+| `bronze_run_id`, `rule_id`, `violation_id` | Required composite identity; `rule_id` resolves to the frozen Bronze reconciliation rule. |
+| `expected_value`, `actual_value` | Optional canonical bounded comparison values. |
+| `evidence_ref` | Optional detailed reconciliation evidence reference. |
+
+```text
+PRIMARY KEY (bronze_run_id, rule_id, violation_id)
+FOREIGN KEY (bronze_run_id) REFERENCES control.bronze_run(bronze_run_id)
+```
+
+**Sample rows**
+
+| bronze_run_id | rule_id | violation_id | expected_value | actual_value |
+|---|---|---|---|---|
+| `bronze_20260920_02` | `selected_matches_published` | `rv-001` | `1000` | `998` |
+| `bronze_20260920_03` | `snapshot_manifest_matches` | `rv-002` | `12 files` | `11 files` |
+
+### Bronze reconciliation results
+
+**Purpose:** Records the aggregate outcome of Bronze reconciliation processing after required
+publication and DQ processing.
+
+| Column | Description |
+|---|---|
+| `bronze_run_id` | Required primary key and FK to the producing run. |
+| `delivery_id` | Optional published delivery FK. |
+| `status` | `PENDING`, `PASSED` or `FAILED`. |
+| `metrics`, `evidence_ref` | Optional bounded reconciliation metrics and aggregate evidence reference. |
+
+```text
+PRIMARY KEY (bronze_run_id)
+FOREIGN KEY (bronze_run_id) REFERENCES control.bronze_run(bronze_run_id)
+FOREIGN KEY (delivery_id) REFERENCES control.bronze_manifest(delivery_id)
+```
+
+**Sample rows**
+
+| bronze_run_id | delivery_id | status | metrics | evidence_ref |
+|---|---|---|---|---|
+| `bronze_20260921_01` | `delivery_customer_20260921` | `PASSED` | `{selected_rows:1000, published_rows:1000}` | `evidence://bronze-recon/01` |
+| `bronze_20260921_02` | `delivery_country_20260921` | `PASSED` | `{expected_files:12, published_files:12}` | `evidence://bronze-recon/02` |
+
+### Silver DQ results
+
+**Purpose:** Records the bounded aggregate result of one Silver DQ rule for a run and optional
+micro-batch. A rule result is idempotent for its run, rule and batch.
+
+| Column | Description |
+|---|---|
+| `silver_run_id`, `rule_id`, `batch_id` | Required composite identity; `rule_id` resolves to the frozen Silver DQ rule. |
+| `status`, `passed_rows`, `failed_rows` | Required outcome and optional bounded aggregate counts. |
+| `metrics`, `evidence_ref` | Optional bounded typed metrics and Delta evidence reference. |
+
+```text
+PRIMARY KEY (silver_run_id, rule_id, batch_id)
+FOREIGN KEY (silver_run_id) REFERENCES control.silver_run(silver_run_id)
+```
+
+**Sample rows**
+
+| silver_run_id | rule_id | batch_id | status | passed_rows | failed_rows |
+|---|---|---:|---|---:|---:|
+| `silver_20260921_01` | `customer_key_not_null` | `42` | `FAILED` | `998` | `2` |
+| `silver_20260921_02` | `country_name_not_null` | `7` | `PASSED` | `195` | `0` |
+
+### Silver DQ violations
+
+**Purpose:** Records a bounded reference to one row-level Silver DQ failure, including a row
+diverted by a supported `QUARANTINE` rule. Detailed rows remain in governed Delta evidence.
+
+| Column | Description |
+|---|---|
+| `silver_run_id`, `rule_id`, `batch_id`, `violation_id` | Required composite retry-stable identity. |
+| `record_identity_ref`, `violation_code` | Optional record identity reference and required registered failure reason. |
+| `evidence_ref` | Optional reference to detailed governed evidence. |
+
+```text
+PRIMARY KEY (silver_run_id, rule_id, batch_id, violation_id)
+FOREIGN KEY (silver_run_id, rule_id, batch_id) REFERENCES control.silver_dq_results(silver_run_id, rule_id, batch_id)
+```
+
+**Sample rows**
+
+| silver_run_id | rule_id | batch_id | violation_id | violation_code |
+|---|---|---:|---|---|
+| `silver_20260921_01` | `customer_key_not_null` | `42` | `sv-001` | `NULL_VALUE` |
+| `silver_20260921_01` | `customer_key_not_null` | `42` | `sv-002` | `NULL_VALUE` |
+
+### Silver reconciliation violations
+
+**Purpose:** Records one bounded Bronze-input-to-target reconciliation mismatch; it cannot make a
+target batch complete when a required reconciliation rule fails.
+
+| Column | Description |
+|---|---|
+| `silver_run_id`, `rule_id`, `batch_id`, `violation_id` | Required composite identity; `rule_id` resolves to the frozen Silver reconciliation rule. |
+| `expected_value`, `actual_value` | Optional canonical bounded comparison values. |
+| `evidence_ref` | Optional detailed reconciliation evidence reference. |
+
+```text
+PRIMARY KEY (silver_run_id, rule_id, batch_id, violation_id)
+FOREIGN KEY (silver_run_id) REFERENCES control.silver_run(silver_run_id)
+```
+
+**Sample rows**
+
+| silver_run_id | rule_id | batch_id | violation_id | expected_value | actual_value |
+|---|---|---:|---|---|---|
+| `silver_20260920_01` | `accepted_matches_mutations` | `41` | `srv-001` | `998` | `997` |
+| `silver_20260920_02` | `replace_count_matches_candidate` | `6` | `srv-002` | `195` | `194` |
+
+### Silver reconciliation results
+
+**Purpose:** Records the aggregate outcome of Silver reconciliation processing per run and
+micro-batch after target mutation and DQ processing.
+
+| Column | Description |
+|---|---|
+| `silver_run_id`, `batch_id` | Required composite primary key. |
+| `status` | `PENDING`, `PASSED` or `FAILED`. |
+| `metrics`, `evidence_ref` | Optional bounded reconciliation metrics and aggregate evidence reference. |
+
+```text
+PRIMARY KEY (silver_run_id, batch_id)
+FOREIGN KEY (silver_run_id) REFERENCES control.silver_run(silver_run_id)
+```
+
+**Sample rows**
+
+| silver_run_id | batch_id | status | metrics | evidence_ref |
+|---|---:|---|---|---|
+| `silver_20260921_01` | `42` | `PASSED` | `{accepted_rows:998, mutations:998}` | `evidence://silver-recon/42` |
+| `silver_20260921_02` | `7` | `PASSED` | `{candidate_rows:195, target_rows:195}` | `evidence://silver-recon/07` |
+
 ### Source Cursor
 
 **Purpose:** Persists bounded Source-to-Bronze extraction progress after proven publication; scope:
@@ -643,6 +1044,13 @@ PRIMARY KEY (source_to_bronze_config_id)
 FOREIGN KEY (source_to_bronze_config_id) REFERENCES metadata.source_to_bronze_config(source_to_bronze_config_id)
 FOREIGN KEY (last_delivery_id) REFERENCES control.bronze_manifest(delivery_id)
 ```
+
+**Sample rows**
+
+| source_to_bronze_config_id | cursor_schema_ref | cursor_payload | last_delivery_id | row_version |
+|---:|---|---|---|---:|
+| `101` | `cursor.watermark_pair@1` | `{watermark:2026-09-21T00:00Z, tie_breaker:9001}` | `delivery_customer_20260921` | `7` |
+| `102` | `cursor.snapshot_token@1` | `NULL` | `delivery_country_20260921` | `1` |
 ### Lease
 
 **Purpose:** Fences ownership of mutable resources and shared provider capacity; scope: one
@@ -669,6 +1077,13 @@ workers stop when renewal or ownership validation fails.
 ```text
 PRIMARY KEY (resource_key)
 ```
+
+**Sample rows**
+
+| resource_key | lease_id | owner_run_id | fencing_token | state | expires_at |
+|---|---|---|---|---|---|
+| `checkpoint:customer_v1` | `lease-501` | `silver_20260921_01` | `501` | `ACTIVE` | `2026-09-21T10:15:00Z` |
+| `provider:crm_provider` | `lease-502` | `pipe_20260921_01` | `502` | `RELEASED` | `2026-09-21T10:10:00Z` |
 ### execution request
 
 **Purpose:** Governs one approved, claimable and terminal one-time operation; scope: one rebuild or
@@ -712,6 +1127,13 @@ not durable dataset configuration and an approved request can be claimed only on
 ```text
 PRIMARY KEY (execution_request_id)
 ```
+
+**Sample rows**
+
+| execution_request_id | operation_type | target_config_ref | status | requested_by | reason_ref |
+|---|---|---|---|---|---|
+| `request-301` | `REBUILD` | `silver.customer:1` | `APPROVED` | `operator@example.com` | `INC-12345` |
+| `request-302` | `RECOVER` | `source.crm_customer:1` | `SUCCEEDED` | `operator@example.com` | `INC-12346` |
 ### audit event
 
 **Purpose:** Retains immutable configuration, governance, lifecycle and outcome transitions; scope:
@@ -748,6 +1170,13 @@ FOREIGN KEY (bronze_run_id) REFERENCES control.bronze_run(bronze_run_id)
 FOREIGN KEY (silver_run_id) REFERENCES control.silver_run(silver_run_id)
 FOREIGN KEY (execution_request_id) REFERENCES control.execution_request(execution_request_id)
 ```
+
+**Sample rows**
+
+| event_id | event_type | actor_id | bronze_run_id | silver_run_id | evidence_ref |
+|---|---|---|---|---|---|
+| `event-1001` | `BRONZE_PUBLICATION_COMPLETED` | `worker-01` | `bronze_20260921_01` | `NULL` | `evidence://delivery_customer_20260921` |
+| `event-1002` | `SILVER_BATCH_COMPLETED` | `worker-02` | `NULL` | `silver_20260921_01` | `evidence://silver-recon/42` |
 ## Public procedure interfaces
 
 The default SQL adapter exposes versioned public procedures, not private table writes. Runtime state
@@ -764,11 +1193,20 @@ algorithms.
 | metadata.usp_upsert_bronze_to_silver_config | Consumer config; reads producer config | Resolve the producer FK and register independent target/checkpoint settings. |
 | metadata.usp_upsert_bronze_policy | `metadata.bronze_policy`; reads source config | Resolve the owner and validate common plus extraction/representation settings. |
 | metadata.usp_upsert_silver_policy | `metadata.silver_policy`; reads consumer config | Resolve the owner and validate common plus load-strategy settings. |
-| metadata.usp_upsert_bronze_rule | `metadata.bronze_rule`; reads source config/policy | Upsert a registered typed check by owner plus stable rule ID. |
-| metadata.usp_upsert_silver_rule | `metadata.silver_rule`; reads consumer config/policy | Upsert an independently owned Silver check by owner plus stable rule ID. |
+| metadata.usp_upsert_bronze_dq_rule | `metadata.bronze_dq_rule`; reads source config/policy | Upsert a registered producer DQ check by owner plus stable rule ID. |
+| metadata.usp_upsert_bronze_recon_rule | `metadata.bronze_recon_rule`; reads source config/policy | Upsert a registered producer reconciliation check by owner plus stable rule ID. |
+| metadata.usp_upsert_silver_dq_rule | `metadata.silver_dq_rule`; reads consumer config/policy | Upsert an independently owned Silver DQ check by owner plus stable rule ID. |
+| metadata.usp_upsert_silver_recon_rule | `metadata.silver_recon_rule`; reads consumer config/policy | Upsert an independently owned Silver reconciliation check by owner plus stable rule ID. |
 | metadata.usp_set_config_enabled | Selected producer/consumer config | Pause/resume future normal planning per configuration; audit changes without cancelling active runs or deleting resources/checkpoints. |
 | control.usp_plan_execution_group | Enabled metadata; creates Pipeline, Bronze and Silver runs | Validate enabled group members, dependency graph, bindings and provider capacity; freeze bounded job plans. |
+| control.usp_get_execution_group_bronze_deliveries | Frozen Bronze runs and rule bindings | Return every `bronze_run_id` selected by one parent pipeline run with its source object, ingestion-method reference, and ordered DQ/reconciliation rule references. |
+| control.usp_get_bronze_reader_plan | Frozen Bronze run plan | Return the source object, capture mode, optional watermark column, frozen relation and boundary reference for one opaque Bronze run. |
+| control.usp_get_silver_consumer_plan | Frozen Silver run plan | Return the retained Bronze input, Silver target, checkpoint, query identity, load strategy, and typed Silver policy for one opaque Silver run. |
 | control.usp_record_bronze_manifest | `control.bronze_manifest`; reads Bronze run | Publish consistent bounded delivery/completeness evidence. |
+| Bronze/Silver DQ result procedures | `control.bronze_dq_results`, `control.silver_dq_results` | Idempotently record aggregate DQ outcomes for the stage, rule and optional delivery/batch. |
+| Bronze/Silver DQ violation procedures | `control.bronze_dq_violation`, `control.silver_dq_violation` | Idempotently record bounded row-level violation references. |
+| Bronze/Silver reconciliation violation procedures | `control.bronze_recon_violation`, `control.silver_recon_violation` | Idempotently record bounded expected-versus-actual mismatches. |
+| Bronze/Silver reconciliation-result procedures | `control.bronze_recon_results`, `control.silver_recon_results` | Idempotently record aggregate reconciliation outcome and evidence. |
 | control.usp_advance_source_cursor | `control.source_cursor`; reads publication/lease evidence | Advance a bounded producer's cursor with compare-and-swap after proven publication. |
 | Lease acquire/renew/release procedures | `control.lease`; reads owner run/resource scope | Claim/fence queries, targets, checkpoints and provider slots; never modify Spark checkpoint files. |
 | control.usp_record_silver_manifest | `control.silver_manifest`, attempt audit events; reads Silver run/query binding | Idempotently record batch effects, reconciliation and completion while preserving attempt history. |
@@ -782,3 +1220,63 @@ For example, `control.usp_plan_execution_group(execution_group_id, environment, 
 returns opaque job-run identities. The Pipeline does not join private tables or interpret policies.
 See [Annotated SQL](../examples/CONTROL_PLANE_CONFIGURATION.md#annotated-desired-state-sql) for
 configuration calls and prerequisite policy setup.
+
+### Framework SQL reader manager
+
+The framework-provided `BronzeControlPlaneManager` uses
+`control.usp_get_bronze_reader_plan` to supply the reader-specific projection of a planned Bronze
+run. The procedure returns exactly one row with `bronze_run_id`, `source_to_bronze_config_id`,
+`bronze_relation_ref`, `source_boundary_ref`, `source_object_ref`, `capture_mode`, and
+`watermark_column`. It MUST read the run's frozen plan, not join mutable desired-state metadata at
+execution time.
+
+A source capability proves the concrete snapshot version or watermark interval, then the manager
+combines that boundary with the procedure result to create the reader request. The reader returns
+source facts and bounded `SourceReadEvidence`; it does not write business rows to Fabric SQL. After
+Bronze publication, the manager passes the evidence's optional selected-row count with publication
+facts to `control.usp_record_bronze_manifest`. A reader result alone MUST NOT advance
+`control.source_cursor`; only the fenced cursor procedure may do so after complete publication.
+
+`SilverControlPlaneManager` uses `control.usp_get_silver_consumer_plan`, which returns exactly one
+frozen projection with `silver_run_id`, both configuration IDs, `bronze_relation_ref`,
+`silver_relation_ref`, `checkpoint_ref`, `query_identity`, `load_strategy`, and every typed
+`metadata.silver_policy` field. Array and schema fields are returned as JSON arrays; typed delete
+marker values retain their JSON types. The procedure MUST return the run's frozen plan rather than
+mutable desired-state metadata. A consumer applies that plan in Spark and sends only its bounded
+micro-batch counts, target commit reference, reconciliation reference, and completion state to
+`control.usp_record_silver_manifest`.
+
+Both managers extend the abstract `ControlPlaneManager` extension point. A deployment can subclass
+either manager to customize only the relevant plan-loading or evidence-recording behavior without
+coupling Bronze ingestion to Silver consumption.
+
+`ExecutionGroupControlPlaneManager` is the producer scheduling adapter for a parent
+`pipeline_run_id`. It reads only `control.usp_get_execution_group_bronze_deliveries`, which returns
+already frozen table deliveries rather than mutable metadata. It records each table's DQ-rule
+results, DQ violation references, reconciliation-rule results, aggregate reconciliation outcome,
+and terminal Bronze-run outcome through separate bounded audit procedures. A runtime factory
+constructs the selected ingestion/DQ/reconciliation capabilities for each returned table delivery;
+the control-plane manager persists evidence but does not execute business-data algorithms.
+
+All physical transports inherit the minimal `Connector` base. It intentionally does not define a
+universal `connect` or `read` operation because Spark-native source connectors and database
+connectors have different connection lifecycles. Every concrete connector MUST implement
+`health()`, which returns bounded `HEALTHY`, `UNHEALTHY`, or `NOT_CONFIGURED` evidence without
+exposing secrets. Connectors MAY release resources through `close()`.
+
+Source connectors retain their separate structural `read()` capability. They use an optional
+configured health-check resource and force a bounded Spark action when it is present; otherwise
+they report `NOT_CONFIGURED`. A source credential rotation resolves a fresh profile or secret and
+creates a replacement connector; it does not pretend that Spark can renew the old connector in
+place.
+
+`FabricSqlDatabase` adds `new_session()` and `renew()` beyond the base contract. It tests a fresh
+session with `SELECT 1` and renews by dropping its pooled connections. `ControlPlaneManager` owns
+parameterized SQL reads and transactional commands over those sessions. An on-premises SQL Server
+adapter can inherit `Connector`, expose compatible `new_session()`, `connect()`, and `begin()`
+operations, and be supplied to either manager without changing Spark reader or consumer code.
+
+`ApiConnector` adds `new_session()` and `renew()` beyond the base contract. A session snapshots the
+current bearer token; `renew()` replaces that token only through a deployment-supplied provider, so
+tokens never appear in control-plane metadata or health output. Existing API sessions retain their
+token snapshot and new sessions use the renewed token.

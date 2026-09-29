@@ -1,10 +1,31 @@
-"""Control-plane port, default SQL adapter, query leases, audit and bounded run state.
+"""Abstract and Fabric SQL control-plane managers."""
 
-Deployments MAY replace the SQL adapter with a company/domain-owned implementation. Spark
-Structured Streaming owns authoritative query offsets and checkpoint contents.
-"""
+from .base import ControlPlaneManager
+from .bronze import (
+    BronzeCompletionState,
+    BronzeControlPlaneManager,
+    BronzePublication,
+    FrozenBronzeReaderPlan,
+)
+from .execution_group import ExecutionGroupControlPlaneManager
+from .silver import (
+    FrozenSilverConsumerPlan,
+    FrozenSilverPolicy,
+    SilverCompletionState,
+    SilverControlPlaneManager,
+    SilverMicroBatch,
+)
 
-from .ports import ControlPlanePort
-from .sql_adapter import SqlControlPlaneAdapter
-
-__all__ = ["ControlPlanePort", "SqlControlPlaneAdapter"]
+__all__ = [
+    "BronzeCompletionState",
+    "BronzeControlPlaneManager",
+    "BronzePublication",
+    "ControlPlaneManager",
+    "ExecutionGroupControlPlaneManager",
+    "FrozenBronzeReaderPlan",
+    "FrozenSilverConsumerPlan",
+    "FrozenSilverPolicy",
+    "SilverCompletionState",
+    "SilverControlPlaneManager",
+    "SilverMicroBatch",
+]

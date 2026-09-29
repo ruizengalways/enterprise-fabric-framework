@@ -1,13 +1,33 @@
-"""Planning, dependency scheduling and Spark runtime coordination."""
+"""Execution-group orchestration for independent table deliveries."""
 
-from .dataset_runner import DatasetRunner, DatasetRuntime, run_dataset
-from .planner import PlanExecutionGroupRequest, PlannedExecutionGroup, plan_execution_group
+from .job import ExecutionGroupJob
+from .table_delivery import (
+    ExecutionGroupOutcome,
+    ExecutionGroupRunner,
+    ExecutionGroupStatus,
+    RuntimeConfiguredTableDeliveryExecutor,
+    TableDelivery,
+    TableDeliveryAuditManager,
+    TableDeliveryEvidence,
+    TableDeliveryExecutor,
+    TableDeliveryRuntimeFactory,
+    TableDeliveryOutcome,
+    TableDeliveryStatus,
+    TableIngestionMethod,
+)
 
 __all__ = [
-    "DatasetRunner",
-    "DatasetRuntime",
-    "PlanExecutionGroupRequest",
-    "PlannedExecutionGroup",
-    "plan_execution_group",
-    "run_dataset",
+    "ExecutionGroupOutcome",
+    "ExecutionGroupJob",
+    "ExecutionGroupRunner",
+    "ExecutionGroupStatus",
+    "RuntimeConfiguredTableDeliveryExecutor",
+    "TableDelivery",
+    "TableDeliveryAuditManager",
+    "TableDeliveryEvidence",
+    "TableDeliveryExecutor",
+    "TableDeliveryRuntimeFactory",
+    "TableDeliveryOutcome",
+    "TableDeliveryStatus",
+    "TableIngestionMethod",
 ]

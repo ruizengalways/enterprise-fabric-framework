@@ -28,9 +28,12 @@ src/enterprise_fabric_framework/
   control_plane/            replaceable control-plane port and default SQL adapter
   orchestration/            planning and runtime coordination
   platform/fabric/          invocation and binding adapters
-  spark/                    the only business-data runtime
+  producer/                 Source-to-Bronze readers, writers, planning and runtime
+  consumer/                 Bronze-to-Silver strategies, projection and runtime
+  quality/                  distributed data-quality evaluation
+  reconciliation/           distributed reconciliation and evidence
+  schema/                   schema-aware hashing and normalization
   recovery/                 governed recovery coordination
-  certification/            production-path certification runners
   cli/                      operator entry points
   utils/                    bounded deterministic utilities
 sql/control_plane/          reusable SQL schema and migration artifacts
@@ -46,6 +49,6 @@ Detailed ownership and the target package tree are canonical in
 
 This is the reusable framework repository. A production domain has its own repository, isolated
 Dev/UAT/Prod workspaces and a control-plane implementation. The framework supplies a default SQL
-adapter, while a company or domain may provide another adapter that satisfies the same typed port.
+adapter, while a deployment may provide another adapter that satisfies the same typed port.
 Domain repositories own Fabric items, idempotent metadata desired state and Gold logic; they select
 versioned framework capabilities rather than supplying private source-to-Silver Python plugins.
